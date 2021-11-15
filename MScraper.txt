@@ -1,0 +1,739 @@
+Sub getRecipe(ByVal control As IRibbonControl)
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Sub
+
+finGood = UCase(Trim(InputBox("Enter Finished Good Name:", Default:=ActiveCell.Value)))
+On Error GoTo norecipe
+BULK = getBulk(finGood)
+If BULK = "" Then GoTo norecipe
+MsgBox BULK, Title:="Bulk found for " + finGood + "!"
+
+Exit Sub
+norecipe:
+MsgBox "No bulk found for: " + finGood
+
+End Sub
+Sub getFinGoods(ByVal control As IRibbonControl)
+Dim goods As Collection
+Dim outputRange As Range
+Dim outputSheet As Worksheet
+Set sesh = login()
+If sesh Is Nothing Then Exit Sub
+
+Set outputRange = Nothing
+recipeName = UCase(Trim(InputBox("Enter Recipe Name:", Title:="e.g. <REDACTED>", Default:=ActiveCell.Value)))
+On Error GoTo norecipe
+Set goods = retFinGoods(recipeName)
+
+For Each gd In goods
+    msg = msg + gd + vbCrLf
+Next gd
+
+msg = msg & vbCrLf & vbCrLf & "Select Yes to output data to sheet."
+
+If MsgBox(msg, vbYesNo, Title:=str(goods.Count) + " finished goods found for " + recipeName + "!") = vbYes Then
+    Set outputRange = utilities.getUserRange()
+    Set outputSheet = ActiveWorkbook.Worksheets(outputRange.Worksheet.Name)
+    col = outputRange.Column
+    rw = outputRange.Row
+    For Each gd In goods
+        outputSheet.Cells(rw, col).Value = gd
+        rw = rw + 1
+    Next gd
+End If
+outputSheet.Activate
+
+Exit Sub
+norecipe:
+MsgBox "No finished goods found for: " + recipeName
+
+End Sub
+Function retFinGoods() As Dictionary
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim finishedPage As HTMLDocument
+Dim finishedTable As HTMLTable
+Dim rw As IHTMLTableRow
+Dim bulks As New Dictionary
+Dim c As Collection
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+sesh.Open "POST", "http://<REDACTED>/AdminFinished.aspx"
+sesh.send
+Set finishedPage = New HTMLDocument
+finishedPage.body.innerHTML = sesh.responseText
+
+Set finishedTable = finishedPage.getElementById("FGTable")
+
+For Each rw In finishedTable.Rows
+    finGood = rw.Cells(1).innerText
+    recName = rw.Cells(2).innerText
+
+    If bulks.Exists(recName) Then
+    'add next finGood to existing collection
+        bulks(recName).Add finGood
+    Else
+    'no recName exists,
+        Set c = New Collection
+        c.Add finGood
+        bulks.Add recName, c
+    End If
+    
+Next rw
+
+Set retFinGoods = bulks
+Exit Function
+
+End Function
+Function getBulk() As Dictionary
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim finishedPage As HTMLDocument
+Dim finishedTable As HTMLTable
+Dim rw As IHTMLTableRow
+Dim finGoods As New Dictionary
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+sesh.Open "POST", "http://<REDACTED>/AdminFinished.aspx"
+sesh.send
+Set finishedPage = New HTMLDocument
+finishedPage.body.innerHTML = sesh.responseText
+
+Set finishedTable = finishedPage.getElementById("FGTable")
+
+For Each rw In finishedTable.Rows
+    finGood = rw.Cells(1).innerText
+    recName = rw.Cells(2).innerText
+    finGoods(finGood) = recName
+    
+Next rw
+
+Set getBulk = finGoods
+Exit Function
+
+
+End Function
+
+Sub getQCHist(ByVal control As IRibbonControl)
+
+Dim recipePage As New HTMLDocument
+Dim h As HTMLBaseElement
+Dim matTable As IHTMLTable
+Dim rw As IHTMLTableRow
+Dim cell As IHTMLTableCell
+Dim bn As New Collection
+Dim ws As Worksheet
+'dictionary to hold batches with actual data
+Dim fullbatchesDict As New Dictionary
+'dictionary to hold raw mat batch num
+Dim batchdict As New Dictionary
+'dictionary of batchdict with inkbatchid as key
+Dim inkRawMatDict As New Dictionary
+Dim isBatchIDNeeded As Boolean
+Dim c As Range
+Dim rawMatCount
+'dictionary to map column number to rawmaterial header
+Dim rawMatColMap As New Dictionary
+'dictionary of rawMat:rawMatSupplierID dict
+Dim rawMatSupMap As New Dictionary
+Dim isEmptyBatch As Boolean
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Sub
+
+recipeName = Trim(UCase(InputBox("enter recipe name:", "e.g.<REDACTED>", "<REDACTED>")))
+Set bn = getBatchNums(recipeName)
+batchHist = Int(InputBox("how many batches?", "i.e. for last 5 batches: 5", 5))
+
+'create new sheet with recipename as sheet name
+Set ws = Sheets.Add
+'ws.Name = recipeName
+
+cellRw = 0
+i = 2
+fullbatches = 0
+
+'collections are 1 based index! (shouldve used dictionary fs)
+'keep going through batches and skip if empty (i.e. viscosity qc is empty for result 1)
+Do While fullbatches < batchHist
+'if not enough completed batches to meet users request - (catches index error)
+
+    If bn.Count < i Then
+        MsgBox ("Only " & fullbatches & " completed batches found!")
+        GoTo getrawMat
+    End If
+        Set recipePage = getBatchDetailsPage(recipeName, bn(i))
+        
+    Set matTable = recipePage.getElementById("BatchQCTable")
+    
+    ' check if viscosity results exist - if not: consider it empty batch
+    'assume empty batch unless first line of qc result (viscosity usually) has a value
+    isEmptyBatch = True
+    
+    For j = 4 To 7
+    'Debug.Print Trim(matTable.Rows(1).Cells(j).innerText), Len(Trim(matTable.Rows(1).Cells(j).innerText))
+        If Len(Trim(matTable.Rows(1).Cells(j).innerText)) > 0 Then
+            isEmptyBatch = False
+        End If
+    Next j
+    
+    If isEmptyBatch Then
+        Debug.Print "empty batch:"; bn(i)
+        GoTo nextBatch
+    Else
+        fullbatches = fullbatches + 1
+        fullbatchesDict.Add bn(i), i
+    End If
+        
+    For Each rw In matTable.Rows
+        cellCol = 0
+        If cellRw > 1 And rw.RowIndex = 0 Then GoTo nextRw
+        cellRw = cellRw + 1
+        'add in batch number
+        ws.Cells(cellRw, 11).Value = bn(i)
+        For Each cell In rw.Cells
+            cellCol = cellCol + 1
+            
+            ws.Cells(cellRw, cellCol).Value = cell.innerText & vbTab
+        Next cell
+        
+nextRw:
+    Next rw
+nextBatch:
+i = i + 1
+Loop
+getrawMat:
+For Each b In fullbatchesDict.Keys
+    'get dictionary of rawmat:batchid for each ink batch
+    Set batchdict = getBatchMaterialID(recipeName, b)
+    'create dictionary of batch:batchRawMatDict
+    'Debug.Print b
+    inkRawMatDict.Add b, batchdict
+Next b
+
+If MsgBox("Add raw material batch numbers?", vbYesNo) = vbYes Then
+    isBatchIDNeeded = True
+Else
+    isBatchIDNeeded = False
+End If
+
+'use inkRawMatDict(ink_batchnumber)(rawMat) to access batch number of raw material
+'e.g. to get <REDACTED> batch of <REDACTED> use: inkRawMatDict("<REDACTED>")("<REDACTED>")
+
+If isBatchIDNeeded Then
+    'set up header row with rawMatNames - use first inkbatch as template for raw material (should be same for all ink batches anyways)
+    'col number of last filled column
+
+    lastFilledCol = 11
+    rawMatCount = 0
+    For Each rawMat In inkRawMatDict(ws.Cells(2, 11).Value).Keys
+        lastFilledCol = lastFilledCol + 1
+        Cells(1, lastFilledCol).Value = rawMat
+        rawMatColMap.Add lastFilledCol, rawMat
+        rawMatCount = rawMatCount + 1
+    Next rawMat
+    'Debug.Print "raw mat count:", rawMatCount
+    
+    'loop through all batchid column rows
+    For Each c In ws.Range(ws.Cells(2, 11), ws.Cells(cellRw, 11))
+        rwBatchID = c.Value
+        'loop through each rawmat column
+        For Each rawMatCell In ws.Range(c.Offset(0, 1), c.Offset(0, rawMatCount))
+            'get rawmat name from current column
+            rawMat = rawMatColMap(rawMatCell.Column)
+            rawMatCell.Value = inkRawMatDict(rwBatchID)(rawMat)
+        Next rawMatCell
+        'go through each ink batch - use header row as dictionary index to find batch number and align with correct column
+        For Each rawMat In inkRawMatDict(rwBatchID).Keys
+            'Debug.Print ink, rawMat, inkRawMatDict(rwBatchID)(rawMat)
+        Next rawMat
+
+    Next c
+Else
+    GoTo hell
+End If
+    
+If MsgBox("Convert to supplier batch id?", vbYesNo) = vbYes Then
+    isSuppConvNeeded = True
+Else
+    isSuppConvNeeded = False
+End If
+
+If isSuppConvNeeded Then
+'create dict of rawMat:rawMatSuppId dict using first batch as template
+
+    For Each rawMat In inkRawMatDict(ws.Cells(2, 11).Value).Keys
+        rawMatSupMap.Add rawMat, supplierIDMap(rawMat)
+    Next rawMat
+    
+    'loop through all batchid column rows
+        For Each c In ws.Range(ws.Cells(2, 11), ws.Cells(cellRw, 11))
+            rwBatchID = c.Value
+            
+            'loop through each rawmat column
+            For Each rawMatCell In ws.Range(c.Offset(0, 1), c.Offset(0, rawMatCount))
+            
+                'get rawmat name from current column
+                rawMat = rawMatColMap(rawMatCell.Column)
+                oracleID = CStr(Format(rawMatCell.Value, "000000"))
+                supId = rawMatSupMap(rawMat)(oracleID)
+                
+                'replace value if supID exists, otherwise just keep as oracleID
+                If Len(Trim(supId)) > 1 Then
+                    rawMatCell.Value = supId
+                End If
+nxtcell:
+            Next rawMatCell
+    
+        Next c
+
+End If
+hell:
+Cells(1, 11).Value = "BatchID"
+Set ws = ActiveSheet
+ws.Columns.AutoFit
+ws.Range("A1").AutoFilter
+Exit Sub
+
+End Sub
+Sub getRecipeMats(ByVal control As IRibbonControl)
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim recipePage As New HTMLDocument
+Dim h As HTMLBaseElement
+Dim matTable As IHTMLTable
+Dim rw As IHTMLTableRow
+Dim cell As IHTMLTableCell
+Dim vals As Range
+Dim v As Range
+Dim outputRange As Range
+Dim outputSheet As Worksheet
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Sub
+
+recipeName = InputBox("enter recipe name:", "e.g. <REDACTED>", Default:=ActiveCell.Value)
+
+'On Error GoTo err
+recipeVersion = InputBox("enter recipe version (preferred =" & getPrefRecipe(recipeName) & "):", , getPrefRecipe(recipeName))
+
+
+sesh.Open "GET", "http://<REDACTED>/RecipeDetails.aspx?RN=" & recipeName & "&RV=" & recipeVersion
+sesh.send
+
+recipePage.body.innerHTML = sesh.responseText
+
+Set matTable = recipePage.getElementById("MMITable")
+If matTable Is Nothing Then
+    GoTo err
+End If
+
+Set outputRange = Nothing
+Set outputRange = MUtils.getUserRange()
+
+Set outputSheet = ActiveWorkbook.Worksheets(outputRange.Worksheet.Name)
+
+cellRw = outputRange.Row
+cellCol = outputRange.Column
+
+currRw = cellRw
+totalqty = 0
+htmlRw = 0
+For Each rw In matTable.Rows
+    htmlRw = htmlRw + 1
+    'mat code col
+    outputSheet.Cells(currRw, cellCol).Value = rw.Cells(0).innerText
+    'matqty col
+    outputSheet.Cells(currRw, cellCol + 1).Value = rw.Cells(2).innerText
+    If htmlRw > 1 Then totalqty = totalqty + CLng(rw.Cells(2).innerText)
+    currRw = currRw + 1
+Next rw
+
+'add percentage
+Set vals = outputSheet.Range(outputSheet.Cells(cellRw + 1, cellCol + 1), outputSheet.Cells(currRw - 1, cellCol + 1))
+outputSheet.Cells(cellRw, cellCol + 2) = "percentage"
+For Each v In vals
+    perc = v.Value / totalqty
+    v.Offset(0, 1) = perc
+Next v
+
+outputSheet.Activate
+Exit Sub
+
+
+err:
+MsgBox "no recipe found!"
+Exit Sub
+
+
+End Sub
+
+Function getBatchNums(recipe)
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim batchPage As New HTMLDocument
+Dim getValPage As New HTMLDocument
+Dim batchIDs As HTMLElementCollection
+Dim col As New Collection
+
+Set sesh = Nothing
+
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+
+batchUrl = "http://<REDACTED>/Batch.aspx"
+sesh.Open "GET", batchUrl
+sesh.send
+
+getValPage.body.innerHTML = sesh.responseText
+
+Set viewState = getValPage.getElementById("__VIEWSTATE")
+Set eventVal = getValPage.getElementById("__EVENTVALIDATION")
+Set stateGen = getValPage.getElementById("__VIEWSTATEGENERATOR")
+
+sesh.Open "POST", batchUrl
+
+sesh.setRequestHeader "Content-Type", "application/x-www-form-urlencoded"
+sesh.setRequestHeader "Host", "<REDACTED>"
+sesh.setRequestHeader "Origin", "http://<REDACTED>"
+sesh.setRequestHeader "Referer", "http://<REDACTED>/Batch.aspx"
+sesh.setRequestHeader "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36"
+
+reqbody = URLEncode("__EVENTTARGET=ctl00$ContentPlaceHolderMain$ddlRecipeName&__EVENTARGUMENT=" & _
+"&__LASTFOCUS=&" & "__VIEWSTATE=" & viewState.Value & "&__VIEWSTATEGENERATOR=" & stateGen.Value & "&__EVENTVALIDATION=" & eventVal.Value & "&ctl00$ContentPlaceHolderMain$ddlRecipeName=" & recipe)
+
+sesh.send reqbody
+
+batchPage.body.innerHTML = sesh.responseText
+
+
+For Each b In batchPage.getElementById("ddlBatchID")
+col.Add b.Value
+Next b
+
+Set getBatchNums = col
+Exit Function
+
+End Function
+
+Function getPrefRecipe(recipe)
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim recipeVersionsPage As New HTMLDocument
+Dim verRw As IHTMLTableRow
+
+Dim verTable As IHTMLTable
+Dim verCell As IHTMLTableCell
+Dim cellClass As HTMLSpanElement
+Set sesh = Nothing
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+getVersionURL = "http://<REDACTED>/RecipeVersion.aspx?RecipeName=" & recipe
+sesh.Open "GET", getVersionURL
+sesh.send
+
+recipeVersionsPage.body.innerHTML = sesh.responseText
+
+Set verTable = recipeVersionsPage.getElementById("recipeVersionTable")
+
+For Each verRw In verTable.Rows
+    'check span for fa-check class
+    If InStr(verRw.Cells(4).innerHTML, "fa-check") Then
+    prefRecipe = verRw.Cells(1).innerHTML
+    End If
+Next verRw
+
+getPrefRecipe = prefRecipe
+Exit Function
+
+End Function
+Public Function URLEncode( _
+   StringVal As String, _
+   Optional SpaceAsPlus As Boolean = False _
+) As String
+
+'returns URL encoded strings for http requests
+'taken from (https://stackoverflow.com/a/218199/11538979)
+  Dim StringLen As Long: StringLen = Len(StringVal)
+
+  If StringLen > 0 Then
+    ReDim result(StringLen) As String
+    Dim i As Long, CharCode As Integer
+    Dim Char As String, Space As String
+
+    If SpaceAsPlus Then Space = "+" Else Space = "%20"
+
+    For i = 1 To StringLen
+      Char = Mid$(StringVal, i, 1)
+      CharCode = Asc(Char)
+      Select Case CharCode
+        Case 97 To 122, 65 To 90, 48 To 57, 45, 46, 95, 126
+          result(i) = Char
+        Case 32
+          result(i) = Space
+        Case 0 To 15
+          result(i) = "%0" & Hex(CharCode)
+        Case 61 'dont encode equals
+            result(i) = Char
+        Case 38 'dont encode ampersand
+            result(i) = Char
+        Case Else
+          result(i) = "%" & Hex(CharCode)
+      End Select
+    Next i
+    URLEncode = Join(result, "")
+  End If
+End Function
+
+Sub colouriseSelection(ByVal control As IRibbonControl)
+Dim cell As Range
+
+For Each cell In Selection
+    Select Case guessCol(UCase(cell.Value))
+    Case "MG", "MAGENTA", "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(255, 0, 0)
+    Case "BK", "BLACK", "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(0, 0, 0)
+        cell.Font.Color = RGB(255, 255, 255)
+    Case "CY", "CYAN", "<REDACTED>", "<REDACTED>"
+    cell.Interior.Color = RGB(0, 176, 240)
+    Case "OR", "ORANGE", "<REDACTED>", "<REDACTED>"
+    cell.Interior.Color = RGB(230, 100, 10)
+    Case "VL", "VIOLET", "<REDACTED>", "<REDACTED>"
+    cell.Interior.Color = RGB(110, 50, 160)
+    Case "YL", "YELLOW", "<REDACTED>", "<REDACTED>"
+    cell.Interior.Color = RGB(255, 255, 0)
+    Case "WT", "WHITE", "<REDACTED>", "<REDACTED>"
+    cell.Interior.Color = RGB(255, 255, 255)
+    End Select
+    
+    'if pigment
+    Select Case UCase(cell.Value)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(255, 0, 0)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(0, 0, 0)
+        cell.Font.Color = RGB(255, 255, 255)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(0, 176, 240)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(230, 100, 10)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(110, 50, 160)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(255, 255, 0)
+    Case "<REDACTED>", "<REDACTED>"
+        cell.Interior.Color = RGB(255, 255, 255)
+    End Select
+    
+Next cell
+End Sub
+
+Function guessCol(str)
+Dim colours As Variant
+shortColours = Array("BK", "CY", "WT", "MG", "OR", "VL", "YL")
+longColours = Array("black", "cyan", "white", "magenta", "orange", "violet", "yellow")
+
+For Each col In shortColours
+    If InStr(UCase(str), UCase(col)) > 0 Then
+        guessCol = UCase(col)
+    End If
+Next col
+
+For Each col In longColours
+    If InStr(UCase(str), UCase(col)) > 0 Then
+        guessCol = UCase(col)
+    End If
+Next col
+
+End Function
+
+Function supplierIDMap(rawMat) As Dictionary
+'''returns dict of oracleid :supplier batch id (from incoming qc page)''''
+
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim finishedPage As HTMLDocument
+Dim supIDs
+Dim IDMap As Dictionary
+
+'Dim oracleID As HTMLInputElement
+Set IDMap = New Dictionary
+
+
+'open qc history incoming mats page from mes
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+sesh.Open "POST", "http://<REDACTED>/ViewRawMaterialsInspectionHistory.aspx?RawMaterial=" & rawMat
+sesh.send
+
+'create html doc with response
+Set finishedPage = New HTMLDocument
+finishedPage.body.innerHTML = sesh.responseText
+
+'find all form-control class (dunno how to match ids with regex yet)
+Set supIDs = finishedPage.getElementsByClassName("form-control")
+
+'grab all ctNums
+For Each ID In supIDs
+    If InStr(ID.Name, "txtSupplierBatchNumber") > 0 Then
+        
+        oracleIDstr = Replace(ID.Name, "txtSupplierBatchNumber", "txtOracleLotID")
+        oracleID = finishedPage.getElementById(oracleIDstr).Value
+        'account for multiple oraclelotid on page shouldn't occur but it does :( 
+        'if blank oracleids exist (why do they exist??) then skip
+        If Len(Trim(oracleID)) < 1 Then GoTo nextid
+        If IDMap.Exists(oracleID) Then GoTo nextid
+        IDMap.Add oracleID, UCase(ID.Value)
+
+    End If
+nextid:
+Next ID
+
+Set supplierIDMap = IDMap
+
+Exit Function
+End Function
+
+Function oracleIDtoSuppID(oracleID As String, rawMat As String) As String
+'returns supplier ID from single oracleID
+
+Dim dict As New Dictionary
+Set dict = supplierIDMap(rawMat)
+
+oracleIDtoSuppID = dict(oracleID)
+End Function
+
+Sub multiIDMap(ByVal control As IRibbonControl)
+'maps multiple oracleLotIDs to supplierID
+'adds supplier id in new inserted column from selected range
+'data taken from incoming qc mes page
+
+Dim c As Range
+Dim rawMat As String
+Dim lotID As String
+Dim mapDict As New Dictionary
+Dim selectedRange As Range
+
+rawMat = InputBox("enter raw material name")
+Set selectedRange = MUtils.getUserRange("Select oracle lot ids (should be in same column)")
+'insert col to right of selection - make space for entering supplier id
+selectedRange.Offset(0, 1).EntireColumn.Insert xlToRight
+
+Set mapDict = supplierIDMap(rawMat)
+
+For Each c In selectedRange
+    'pad lotid number
+    lotID = CStr(Format(c.Value, "000000"))
+    c.Offset(0, 1).Value = mapDict(lotID)
+Next c
+
+End Sub
+
+Function getBatchMaterialID(recipeName, batch) As Dictionary
+'returns dictionary of rawMat:(oracle)batchID
+'recipeName:<REDACTED>
+'batch arg: <REDACTED>_0000004
+
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim recipePage As New HTMLDocument
+Dim h As HTMLBaseElement
+Dim matTable As IHTMLTable
+Dim rw As IHTMLTableRow
+Dim cell As IHTMLTableCell
+Dim batchIDs As Dictionary
+Dim fullBatchID As Variant
+
+Set batchIDs = New Dictionary
+
+'Set sesh = login()
+'If sesh Is Nothing Then Exit Function
+'
+'On Error GoTo err
+'
+'
+'sesh.Open "GET", "http://<REDACTED>/ViewBatchDetails.aspx?RN=" & recipeName & "&BatchID=" & recipeName & "_" & Format(batch, "000000")
+'sesh.send
+'
+'recipePage.body.innerHTML = sesh.responseText
+
+Set recipePage = getBatchDetailsPage(recipeName, batch)
+
+Set matTable = recipePage.getElementById("MMITable")
+If matTable Is Nothing Then
+    GoTo err
+End If
+
+htmlRw = 0
+For Each rw In matTable.Rows
+    If htmlRw = 0 Then GoTo nxtrw
+    
+    'grab lot number column
+    lotNumText = rw.Cells(2).innerText
+    'returns 0 based array (or -1 if no split match)
+    fullBatchID = Split(lotNumText, "_")
+    
+    If UBound(fullBatchID) < 0 Then GoTo nxtrw
+    rawMat = fullBatchID(0)
+    
+    If UBound(fullBatchID) > 0 Then
+        'batchid exists
+        batchId = fullBatchID(1)
+    Else
+        'no batchid
+        batchId = ""
+    End If
+    If batchIDs.Exists(rawMat) Then GoTo nxtrw
+    batchIDs.Add rawMat, batchId
+nxtrw:
+
+htmlRw = htmlRw + 1
+Next rw
+Set getBatchMaterialID = batchIDs
+
+Exit Function
+
+err:
+Debug.Print "no materials found for "; recipeName; lotNumText
+Exit Function
+
+End Function
+
+Sub testBatchIDs()
+Dim dict As New Dictionary
+
+Set dict = getBatchMaterialID("<REDACTED>", "<REDACTED>_000004")
+
+col = 0
+For Each mat In dict.Keys
+    col = col + 1
+    Cells(1, col) = mat
+    Cells(2, col) = dict(mat)
+Next mat
+
+End Sub
+
+Function getBatchDetailsPage(recipeName, batch) As HTMLDocument
+'returns html page of view batch details page on MES
+'recipe arg: <REDACTED>
+'batch argument: <REDACTED>_000005
+
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim page As New HTMLDocument
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+
+On Error GoTo err
+
+batchUrl = "http://<REDACTED>/ViewBatchDetails.aspx?RN=" & recipeName & "&BatchID=" & batch
+
+sesh.Open "GET", batchUrl
+sesh.send
+
+page.body.innerHTML = sesh.responseText
+
+Set getBatchDetailsPage = page
+
+err:
+End Function
+

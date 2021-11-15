@@ -1,0 +1,124 @@
+'utility funcs subs etc to help with development
+Public selectedRange
+
+Sub highlightFormulaCells(control As IRibbonControl)
+    ActiveSheet.Cells.SpecialCells(xlCellTypeFormulas).Select
+End Sub
+   
+Public Function getUserRange(Optional prompt As String = "Select range to output data") As Range
+
+With rangePicker
+    .Height = 115
+    .Width = 170
+    .Label1.Caption = prompt
+    .Left = Application.Left + (0.5 * Application.Width) - (0.5 * .Width)
+    .Top = Application.Top + (0.5 * Application.Height) - (0.5 * .Height)
+    .Show
+End With
+
+Set getUserRange = Range(selectedRange)
+'Debug.Print "util:"; selectedRange
+
+End Function
+
+Sub changeMESBarcode(control As IRibbonControl)
+
+'stores/updates MES barcode in xlam workbook
+
+pass = Format(ThisWorkbook.Sheets("config_params").Range("mesPass").Value, "0000")
+If pass = "" Then
+    GoTo noBarcode
+End If
+
+pass = Format(Trim(InputBox("Current MES Barcode is: " & pass & vbCrLf & vbCrLf & "(" & getBarcodeUser() & ")", "enter Barcode e.g. 1234", Default:=pass)), "0000")
+If pass = "" Then GoTo notOverwritten
+ThisWorkbook.Sheets("config_params").Range("mesPass").Value = pass
+MsgBox "MES Barcode overwritten with: " & pass
+ThisWorkbook.Save
+
+Exit Sub
+noBarcode:
+pass = Trim(InputBox("Enter MES Barcode: ", "enter Barcode e.g. 1234"))
+ThisWorkbook.Sheets("config_params").Range("mesPass").Value = pass
+ThisWorkbook.Save
+Exit Sub
+notOverwritten:
+End Sub
+
+Function getBarcodeUser()
+'scrape login page for username after login sesh established
+
+Dim sesh As MSXML2.ServerXMLHTTP60
+Dim homePage As New HTMLDocument
+Dim loginSpan As IHTMLElement
+
+Set sesh = login()
+If sesh Is Nothing Then Exit Function
+sesh.Open "GET", "http://<REDACTED>/default.aspx"
+sesh.send
+
+'Debug.Print sesh.responseText
+homePage.body.innerHTML = sesh.responseText
+Set loginSpan = homePage.getElementsByClassName("pull-right")(0)
+If loginSpan Is Nothing Then
+    Set getBarcodeUser = Nothing
+    Exit Function
+End If
+
+getBarcodeUser = loginSpan.innerText
+Exit Function
+
+End Function
+
+Function login() As MSXML2.ServerXMLHTTP60
+Dim req As New MSXML2.ServerXMLHTTP60
+Dim loginPage As New HTMLDocument
+Dim viewState As Object
+Dim homePage As New HTMLDocument
+Dim loginSpan As IHTMLElement
+Dim mesBarcode As String
+
+mesBarcode = Format(ThisWorkbook.Sheets("config_params").Range("mesPass").Value, "0000")
+
+If mesBarcode = "" Then
+    Set login = Nothing
+    MsgBox "No existing barcode found, use ""Change MES Barcode"" button to add barcode", vbCritical
+    Exit Function
+End If
+
+loginURL = "http://<REDACTED>/Login.aspx"
+
+req.Open "GET", loginURL
+req.send
+
+loginPage.body.innerHTML = req.responseText
+
+Set viewState = loginPage.getElementById("__VIEWSTATE")
+Set eventVal = loginPage.getElementById("__EVENTVALIDATION")
+Set stateGen = loginPage.getElementById("__VIEWSTATEGENERATOR")
+
+reqbody = "__VIEWSTATE=" & URLEncode(viewState.Value) & "&__VIEWSTATEGENERATOR=" & URLEncode(stateGen.Value) & "&__EVENTVALIDATION=" & URLEncode(eventVal.Value) & "&txtBarcode=" & mesBarcode & "&btSubmit=" & "Login"
+'Debug.Print (reqBody)
+
+
+req.Open "POST", loginURL, False
+
+req.setRequestHeader "Content-Type", "application/x-www-form-urlencoded"
+
+req.send reqbody
+
+req.Open "GET", "http://<REDACTED>/default.aspx"
+req.send
+
+'Debug.Print sesh.responseText
+homePage.body.innerHTML = req.responseText
+Set loginSpan = homePage.getElementsByClassName("pull-right")(0)
+If loginSpan Is Nothing Then
+    Set login = Nothing
+    MsgBox "No user found for Barcode: " & mesBarcode & vbCrLf & "Use ""Change MES Barcode"" button to update barcode", vbCritical
+    Exit Function
+End If
+
+Set login = req
+
+End Function
